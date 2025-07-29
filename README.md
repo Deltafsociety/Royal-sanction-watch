@@ -100,7 +100,14 @@ The application uses the following public data sources:
     * Ensure the column containing IMO numbers in your Excel files is named clearly (e.g., "IMO Number", "IMO", "ID", "Vessel Name" if IMOs are embedded there). The tool searches for common patterns in column headers.
     * Confirm the numbers are consistently 7 digits.
 * **"My Vessels" data not saving:** Check if the `my_vessels.csv` file is being created in the same directory as your script. Ensure you have write permissions to that directory.
+## Compiling
+```bash
+   python -m venv venv
 
+   pip install pandas requests beautifulsoup4 lxml openpyxl fake-useragent
+    
+   pyinstaller --onefile --windowed --icon=app_icon.ico your_script_name.py
+```
 ## Contact
 
 For any problems or queries, please contact: `Delta.fsociety@tutamail.com`
