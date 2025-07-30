@@ -48,7 +48,7 @@ This application is a comprehensive desktop tool designed to assist maritime pro
 2.  **Install required libraries:**
     Open your terminal or command prompt and run the following command:
     ```bash
-    pip install pandas requests beautifulsoup4 lxml openpyxl fake-useragent
+    pip install requests pandas openpyxl beautifulsoup4 lxml fake-useragent urllib3
     ```
 
 ## How to Use
@@ -106,7 +106,12 @@ The application uses the following public data sources:
 
    pip install pandas requests beautifulsoup4 lxml openpyxl fake-useragent
     
-   pyinstaller --onefile --windowed --icon=app_icon.ico your_script_name.py
+   pyinstaller --onefile --windowed --icon=app_icon.ico \
+--hidden-import=lxml \
+--hidden-import=xml.etree.ElementTree \
+--hidden-import=requests.certs \
+--hidden-import=charset_normalizer \
+your_script_name.py
 ```
 ## Contact
 
