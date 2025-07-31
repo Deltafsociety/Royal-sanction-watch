@@ -12,22 +12,34 @@ import xml.etree.ElementTree as ET
 import sys
 import csv # For My Vessels CSV persistence
 import datetime # Import datetime for timestamping files
+import importlib.resources # For accessing bundled files
 
 # --- Configuration for report freshness ---
 MAX_REPORT_AGE_SECONDS = 3600 * 24 # 24 hours (adjust as needed)
 
 # --- Global Queues for thread-safe GUI updates ---
 gui_update_queue = queue.Queue() # For SanctionsAppFrame
-excel_comparator_log_queue = queue.Queue() # For ExcelComparatorFrame
 my_vessels_log_queue = queue.Queue() # For MyVesselsAppFrame
+sanctions_display_queue = queue.Queue() # For SanctionsDisplayFrame
 
+# --- Global Data Store for fetched Sanctions Data (in-memory) ---
+# This will hold the fetched DataFrames for easy access across tabs
+global_sanctions_data_store = {
+    "OFAC_Vessels": None,
+    "UK_Sanctions_Vessels": None,
+    "EU_DMA_Vessels": None,
+    "UANI_Vessels_Tracked": None
+}
 
 # --- Configuration ---
 OFAC_SDN_CSV_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
 UK_SANCTIONS_PUBLICATION_PAGE_URL = "https://www.gov.uk/government/publications/the-uk-sanctions-list"
 DMA_XLSX_URL = "https://www.dma.dk/Media/638834044135010725/2025118019-7%20Importversion%20-%20List%20of%20EU%20designated%20vessels%20(20-05-2025)%203010691_2_0.XLSX"
-UANI_SHEET_ID = "19SBq7N1Ety5fCfaTOZUf61QY-hJIouptx9Gv-uosR_k"
-UANI_CSV_URL = f"https://docs.google.com/spreadsheets/d/{UANI_SHEET_ID}/export?format=csv&gid=0"
+UANI_WEBSCRAPE_URL = "https://www.unitedagainstnucleariran.com/blog/switch-list-tankers-shift-from-carrying-iranian-oil-to-russian-oil"
+UANI_BUNDLED_CSV_NAME = "UANI_Switch_List_Bundled.csv" # Name of the CSV file to bundle
+
+# Define common column patterns for numerical identifiers like IMO numbers
+IMO_LIKE_COLUMN_PATTERNS = ['imo', 'id', 'number', 'code', 'vesselimo', 'imo no']
 
 
 # --- Global User-Agent Initializer & Retry setup ---
@@ -36,9 +48,8 @@ try:
     import pandas as pd # Import pandas as pd
     from bs4 import BeautifulSoup
     import lxml # Explicitly try to import lxml parser
-    import openpyxl
-    from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill
+    import openpyxl # Keep for type hinting and potential future use, though not directly used in fetching anymore
+    from openpyxl.styles import PatternFill # Keep for potential future use or if some logic still relies on it
     from fake_useragent import UserAgent # Import for random user agents
     from requests.adapters import HTTPAdapter # Import for retries
     from urllib3.util.retry import Retry # Import for retries
@@ -62,27 +73,36 @@ except ImportError as e:
 
 
 # --- Global User-Agent Initializer & Requests Session Setup ---
-try:
-    ua = UserAgent()
+ua = None # Initialize ua outside try-block to ensure it always exists
+http_session = None # Initialize http_session outside try-block
 
-    # Configure retry strategy for network robustness
+try:
+    # Initialize UserAgent first, with a more specific fallback if it fails
+    try:
+        ua = UserAgent()
+        print("DEBUG: fake_useragent initialized successfully.")
+    except Exception as e:
+        print(f"WARNING: Failed to initialize fake_useragent: {e}. Using static User-Agent. Traceback: {sys.exc_info()}")
+        # If fake_useragent fails, we proceed with ua = None, so the get_soup fallback is used.
+        ua = None
+
+    # Always attempt to set up http_session
     retry_strategy = Retry(
-        total=5, # Increased retries to 5
-        backoff_factor=2, # Exponential backoff (1s, 2s, 4s, 8s, 16s)
-        status_forcelist=[429, 500, 502, 503, 504], # Status codes to retry on
-        allowed_methods=["HEAD", "GET", "OPTIONS"] # Methods to retry
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     http_session = requests.Session()
     http_session.mount("https://", adapter)
     http_session.mount("http://", adapter)
+    print("DEBUG: requests.Session initialized successfully.")
 
 except Exception as e:
-    # This block handles any errors during the setup, but the ImportError is already handled at top.
-    # We set ua and http_session to None so the rest of the code can fall back gracefully.
-    print(f"Warning: An unexpected error occurred during networking setup: {e}. Traceback: {sys.exc_info()}")
-    ua = None
-    http_session = None
+    # This block now only catches issues with requests.Session setup itself
+    print(f"CRITICAL ERROR: Failed to set up requests.Session: {e}. Network operations may fail. Traceback: {sys.exc_info()}")
+    http_session = None # Set to None only if session setup fails entirely
 
 
 # --- Helper: Log to GUI and Console ---
@@ -94,10 +114,16 @@ class TextRedirector(object):
 
     def write(self, str_val):
         self.queue.put({'type': 'log', 'message': str_val})
-        self.stdout.write(str_val) # Also print to original stdout/console
+        # REMOVED: self.stdout.write(str_val)
+        # This line was causing AttributeError: 'NoneType' object has no attribute 'write'
+        # in compiled --windowed applications, as sys.stdout is detached.
 
     def flush(self):
-        self.stdout.flush()
+        # The flush for the original stdout is no longer necessary if we don't write to it.
+        # But keeping it might prevent other unexpected issues if some part of Python
+        # still tries to flush a detached stdout.
+        if self.stdout is not None:
+            self.stdout.flush()
 
 def log_to_gui_and_console(message):
     """Sends a message to the console and to the GUI queue for thread-safe UI updates for SanctionsApp."""
@@ -110,11 +136,18 @@ def get_soup(url, is_xml=False, delay_seconds=1):
     try:
         current_session = http_session if http_session else requests # Use global session or fallback to plain requests
         
-        user_agent_string = ua.random if ua else 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        # Use a more generic but common User-Agent if ua is None (fake_useragent failed)
+        # This specific User-Agent string is known to work for many sites.
+        user_agent_string = ua.random if ua else 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
         headers = {'User-Agent': user_agent_string}
         
+        # Ensure current_session is not None before making the request
+        if current_session is None:
+            log_to_gui_and_console(f"Network error: http_session is None. Cannot fetch {url}. Session setup failed.")
+            return None
+
         response = current_session.get(url, timeout=60, headers=headers) # Increased timeout to 60s
-        response.raise_for_status()
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         log_to_gui_and_console(f"Successfully fetched: {url} with status {response.status_code}")
         
         parser_type = 'lxml-xml' if is_xml else 'lxml'
@@ -250,7 +283,7 @@ def fetch_uk_sanctions_vessels(progress_callback, pd_module): # Added pd_module 
                 context_start = max(0, match.start() - 200)
                 context = full_text[context_start : match.start()]
                 
-                name_pattern = r'(?:Name\s*[:;]\s*|Vessel Name\s*[:;]\s*)([^\n,;]+)'
+                name_pattern = r'(?:Name\s*[:;]\s*|Vessel Name\s*[:;]\s*)([^\n,仿佛;]{5,100}?)\s*vessel' # Updated regex
                 name_match = re.search(name_pattern, context, re.IGNORECASE)
                 
                 name = "Unknown UK Vessel"
@@ -324,70 +357,121 @@ def fetch_dma_vessels(pd_module): # Added pd_module parameter
         log_to_gui_and_console(f"DMA: Error processing DMA data: {e}. Traceback: {sys.exc_info()}")
         return pd_module.DataFrame() # Use pd_module
 
+# MODIFIED fetch_uani_vessels to prioritize bundled CSV
 def fetch_uani_vessels(pd_module): # Added pd_module parameter
-    log_to_gui_and_console(f"\n--- Fetching UANI data from Google Sheet ---")
+    log_to_gui_and_console(f"\n--- Fetching UANI data ---")
+    
+    # Try to load from bundled CSV first
     try:
-        log_to_gui_and_console("UANI: Initiating request...")
-        current_session = http_session if http_session else requests # Use global session or fallback
-        response = current_session.get(UANI_CSV_URL, timeout=60, headers={'User-Agent': ua.random if ua else 'Mozilla/5.0'})
-        response.raise_for_status()
-        csv_text = response.content.decode('utf-8')
-        log_to_gui_and_console("UANI: CSV content downloaded. Parsing...")
+        # Determine the base path correctly for frozen (compiled) vs. unfrozen (script)
+        base_path = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
+        bundled_csv_full_path = os.path.join(base_path, UANI_BUNDLED_CSV_NAME)
         
-        lines = csv_text.splitlines()
-        header_row_index = -1
-        for i, line in enumerate(lines):
-            if 'imo' in line.lower() and ('vessel' in line.lower() or 'name' in line.lower()):
-                header_row_index = i
-                break
-        
-        if header_row_index == -1:
-            log_to_gui_and_console(f"UANI: Error: Could not find header row with 'IMO' and 'Vessel/Name' in UANI Google Sheet. Traceback: {sys.exc_info()}")
-            return pd_module.DataFrame() # Use pd_module
-        
-        clean_csv_text = "\n".join(lines[header_row_index:])
-        df = pd_module.read_csv(StringIO(clean_csv_text)) # Use pd_module
-        log_to_gui_and_console("UANI: Google Sheet content parsed.")
-        
-        original_columns = list(df.columns)
-        cleaned_columns_map = {str(col).strip().lower(): col for col in original_columns}
-        
-        imo_col_key = None
-        name_col_key = None
+        if os.path.exists(bundled_csv_full_path):
+            log_to_gui_and_console(f"UANI: Attempting to load from bundled CSV: {bundled_csv_full_path}")
+            df = pd_module.read_csv(bundled_csv_full_path)
+            
+            # Normalize column names in the loaded DataFrame
+            original_columns = list(df.columns)
+            cleaned_columns_map = {str(col).strip().lower(): col for col in original_columns}
+            
+            imo_col_key = None
+            name_col_key = None
 
-        for pattern in ['imo', 'imo number', 'imo no']:
-            if pattern in cleaned_columns_map:
-                imo_col_key = cleaned_columns_map[pattern]
-                break
-        
-        for pattern in ['vessel name', 'vessel', 'name']:
-            if pattern in cleaned_columns_map:
-                name_col_key = cleaned_columns_map[pattern]
-                break
+            for pattern in ['imo', 'imo number', 'imo no']:
+                if pattern in cleaned_columns_map:
+                    imo_col_key = cleaned_columns_map[pattern]
+                    break
+            
+            for pattern in ['vessel name', 'vessel', 'name']:
+                if pattern in cleaned_columns_map:
+                    name_col_key = cleaned_columns_map[pattern]
+                    break
+            
+            if imo_col_key and name_col_key:
+                df = df[[name_col_key, imo_col_key]].copy()
+                df.rename(columns={name_col_key: "Vessel Name", imo_col_key: "IMO Number"}, inplace=True)
+                df["Source"] = "UANI (Bundled CSV)"
+                df.dropna(subset=["IMO Number"], inplace=True)
+                df["IMO Number"] = df["IMO Number"].astype(str).apply(lambda x: re.sub(r'\D', '', str(x)))
+                df = df[df['IMO Number'].str.match(r'^\d{7}$')]
+                log_to_gui_and_console(f"UANI: Successfully loaded {len(df)} vessels from bundled CSV.")
+                return df
+            else:
+                log_to_gui_and_console(f"UANI: Bundled CSV headers missing 'IMO' or 'Vessel Name'. Headers: {original_columns}. Attempting web scrape fallback.")
 
-        if not imo_col_key or not name_col_key:
-            log_to_gui_and_console(f"UANI: Error: Missing 'imo' ({imo_col_key}) or 'vessel name' ({name_col_key}) column in UANI Google Sheet after header parsing. Found cols: {df.columns.tolist()}. Traceback: {sys.exc_info()}")
-            return pd_module.DataFrame() # Use pd_module
-
-        df = df[[name_col_key, imo_col_key]].copy()
-        df.rename(columns={name_col_key: "Vessel Name", imo_col_key: "IMO Number"}, inplace=True)
-        df["Source"] = "UANI (Google Sheet)"
-        df.dropna(subset=["IMO Number"], inplace=True)
-        df["IMO Number"] = df["IMO Number"].astype(str).apply(lambda x: re.sub(r'\D', '', str(x)))
-        
-        df = df[df['IMO Number'].str.match(r'^\d{7}$')]
-        
-        log_to_gui_and_console(f"UANI: Found {len(df)} UANI vessels.")
-        return df
-    except requests.exceptions.RequestException as e:
-        log_to_gui_and_console(f"Network error processing UANI Google Sheet data: {e}. Traceback: {sys.exc_info()}")
-        return pd_module.DataFrame() # Use pd_module
     except Exception as e:
-        log_to_gui_and_console(f"UANI: Error processing UANI Google Sheet data: {e}. Traceback: {sys.exc_info()}")
-        return pd_module.DataFrame() # Use pd_module
+        log_to_gui_and_console(f"UANI: Error loading bundled CSV ({UANI_BUNDLED_CSV_NAME}): {e}. Falling back to web scrape. Traceback: {sys.exc_info()}")
+
+    # Fallback to web scraping if bundled CSV fails or doesn't exist/is malformed
+    log_to_gui_and_console(f"UANI: Attempting web scrape from {UANI_WEBSCRAPE_URL}...")
+    try:
+        soup = get_soup(UANI_WEBSCRAPE_URL)
+        if not soup:
+            log_to_gui_and_console("UANI: Failed to get soup from UANI URL (web scrape fallback).")
+            return pd_module.DataFrame()
+
+        log_to_gui_and_console("UANI: HTML content downloaded. Searching for tables...")
+        
+        tables = soup.find_all('table')
+        vessels_data = []
+        
+        for table_idx, table in enumerate(tables):
+            headers = [th.get_text(strip=True) for th in table.find_all('th')]
+            
+            imo_col_idx = -1
+            name_col_idx = -1
+            
+            normalized_headers = [h.lower().replace('*', '').strip() for h in headers]
+            
+            for idx, header in enumerate(normalized_headers):
+                if 'imo' in header and imo_col_idx == -1:
+                    imo_col_idx = idx
+                if ('vessel' in header or 'name' in header) and name_col_idx == -1:
+                    name_col_idx = idx
+            
+            if imo_col_idx != -1 and name_col_idx != -1:
+                log_to_gui_and_console(f"UANI: Found relevant table (Table {table_idx+1}) with IMO (col {imo_col_idx}) and Name (col {name_col_idx}) columns.")
+                rows = table.find_all('tr')
+                
+                for r_idx, row in enumerate(rows):
+                    if r_idx == 0:
+                        continue
+                        
+                    cols = row.find_all(['td', 'th'])
+                    cols = [ele.text.strip() for ele in cols]
+                    
+                    if len(cols) > max(imo_col_idx, name_col_idx):
+                        vessel_name = cols[name_col_idx]
+                        imo_number = cols[imo_col_idx]
+                        
+                        imo_number = re.sub(r'\D', '', str(imo_number)).strip()
+                        
+                        if re.fullmatch(r'^\d{7}$', imo_number):
+                            vessels_data.append({"Vessel Name": vessel_name, "IMO Number": imo_number, "Source": "UANI (Web Scrape)"})
+                
+                log_to_gui_and_console(f"UANI: Processed {len(vessels_data)} entries from Table {table_idx+1}.")
+                break
+            else:
+                log_to_gui_and_console(f"UANI: Table {table_idx+1} does not contain both 'IMO' and 'Vessel Name' columns. Headers: {headers}")
+
+        df = pd_module.DataFrame(vessels_data)
+        
+        if not df.empty:
+            df.drop_duplicates(subset=['IMO Number'], keep='first', inplace=True)
+            
+        log_to_gui_and_console(f"UANI: Final {len(df)} vessels from web scrape.")
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        log_to_gui_and_console(f"Network error fetching UANI HTML data (web scrape fallback): {e}. Traceback: {sys.exc_info()}")
+        return pd_module.DataFrame()
+    except Exception as e:
+        log_to_gui_and_console(f"UANI: Error processing UANI HTML data (web scrape fallback): {e}. Traceback: {sys.exc_info()}")
+        return pd_module.DataFrame()
 
 # --- Worker function for Sanctions Report ---
-def process_all_data(output_filepath, on_complete_callback=None):
+def process_all_data(on_complete_callback=None, display_callback=None): # Removed output_filepath
     # Total steps for the main progress bar:
     # 1. OFAC Fetch
     # 2. UK Fetch (get page)
@@ -395,8 +479,7 @@ def process_all_data(output_filepath, on_complete_callback=None):
     # 4. UK Fetch (ODT parse)
     # 5. DMA Fetch
     # 6. UANI Fetch
-    # 7. Excel Write
-    total_steps = 7
+    total_steps = 6 # Reduced total steps as Excel write is removed
     current_step = 0
     gui_update_queue.put({'type': 'progress_config', 'max': total_steps})
     
@@ -409,219 +492,67 @@ def process_all_data(output_filepath, on_complete_callback=None):
 
     log_to_gui_and_console("Starting sanctions report generation...")
     
+    fetched_data = {} # Dictionary to store fetched DataFrames
+
     try:
         # Import pandas inside this function to ensure it's available in the thread
         import pandas as pd_local 
 
         # Fetch OFAC data (pass pd_local explicitly)
         df_ofac = fetch_ofac_vessels(pd_local)
+        fetched_data["OFAC_Vessels"] = df_ofac
         increment_progress() 
         
         # Fetch UK sanctions data (pass pd_local explicitly)
         df_uk = fetch_uk_sanctions_vessels(progress_callback=increment_progress, pd_module=pd_local)
+        fetched_data["UK_Sanctions_Vessels"] = df_uk
         
         # Fetch DMA data (pass pd_local explicitly)
         df_dma = fetch_dma_vessels(pd_local)
+        fetched_data["EU_DMA_Vessels"] = df_dma
         increment_progress()
         
         # Fetch UANI data (pass pd_local explicitly)
         df_uani = fetch_uani_vessels(pd_local)
+        fetched_data["UANI_Vessels_Tracked"] = df_uani
         increment_progress()
         
-        log_to_gui_and_console("\nWriting data to Excel file...")
-        timestamp = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-        base_name = os.path.basename(output_filepath).replace(".xlsx", "").replace(".xls", "")
-        final_output_filepath = os.path.join(os.path.dirname(output_filepath), f"{base_name}_{timestamp}.xlsx")
+        log_to_gui_and_console("\nDisplaying data in Sanctions Report Viewer tab...")
 
-        with pd_local.ExcelWriter(final_output_filepath, engine='openpyxl') as writer: # Use pd_local
-            def write_sheet(df, sheet_name):
-                if not df.empty:
-                    df_copy = df.copy()
-                    if 'IMO Number' in df_copy.columns:
-                        df_copy['IMO Number'] = df_copy['IMO Number'].astype(str)
-                    
-                    if 'IMO Number' in df_copy.columns:
-                        df_copy.drop_duplicates(subset=['IMO Number'], keep='first').to_excel(writer, sheet_name=sheet_name, index=False)
-                    else:
-                        df_copy.drop_duplicates(keep='first').to_excel(writer, sheet_name=sheet_name, index=False)
-
-                    log_to_gui_and_console(f"{sheet_name} data written.")
-                else:
-                    log_to_gui_and_console(f"No data for {sheet_name} to write.")
-            
-            write_sheet(df_ofac, "OFAC_Vessels")
-            write_sheet(df_uk, "UK_Sanctions_Vessels")
-            write_sheet(df_dma, "EU_DMA_Vessels")
-            write_sheet(df_uani, "UANI_Vessels_Tracked")
+        # Update the global data store
+        global global_sanctions_data_store
+        global_sanctions_data_store.update(fetched_data)
+        
+        # Call the display callback to show data in the new tab
+        if display_callback:
+            display_callback(global_sanctions_data_store)
         
         gui_update_queue.put({'type': 'show_message', 'kind': 'info', 'title': 'Success',
-                               'message': f"Report generated successfully:\n{final_output_filepath}"})
+                              'message': "Sanctions report data fetched and displayed successfully in 'Sanctions Report Viewer' tab."})
+        
         if on_complete_callback:
-            on_complete_callback(final_output_filepath) # Pass the final path back
+            # Pass the fact that data is loaded in-memory, no file path needed
+            on_complete_callback(True) 
 
     except Exception as e:
         log_to_gui_and_console(f"Error during main report processing: {e}. Traceback: {sys.exc_info()}")
-        gui_update_queue.put({'type': 'show_message', 'kind': 'error', 'title': 'Excel Write Error',
-                               'message': f"Could not write the Excel file.\nError: {e}"})
+        gui_update_queue.put({'type': 'show_message', 'kind': 'error', 'title': 'Report Generation Error',
+                              'message': f"An error occurred during report generation: {e}"})
         if on_complete_callback:
-            on_complete_callback(None) # Signal failure
+            on_complete_callback(False) # Signal failure
             
-    increment_progress() # Final increment for Excel write completion
+    # Final increment for data display completion
+    increment_progress() 
     gui_update_queue.put({'type': 'processing_done'})
     log_to_gui_and_console("\nScript finished.")
-
-# --- Excel Comparison Logic ---
-
-# Global DataFrames to hold loaded data for search functionality
-# g_dfs1 and g_dfs2 will be populated from outside.
-# Access to pd here is fine as it's outside threaded function.
-g_dfs1 = {}
-g_dfs2 = {}
-
-# Define common column patterns for numerical identifiers like IMO numbers
-IMO_LIKE_COLUMN_PATTERNS = ['imo', 'id', 'number', 'code', 'vesselimo', 'imo no']
-
-def is_imo_like_column(column_name):
-    """Checks if a column name indicates an IMO-like number column for targeted highlighting."""
-    cleaned_col_name = str(column_name).strip().lower()
-    for pattern in IMO_LIKE_COLUMN_PATTERNS:
-        if pattern in cleaned_col_name:
-            return True
-    return False
-
-def compare_and_highlight_excel_threaded(file1_path, file2_path, output_choice, output_folder, status_callback=None):
-    """
-    Worker function for the Excel comparison, run in a separate thread.
-    Highlights common numerical identifiers in identified 'IMO-like' columns in red.
-    """
-    def update_status(message):
-        if status_callback:
-            status_callback(message)
-        else:
-            excel_comparator_log_queue.put(f"[Excel Comparator] {message}")
-
-    update_status("Starting comparison...")
-
-    try:
-        # Import pandas inside this function to ensure it's available in the thread
-        import pandas as pd_local 
-
-        if not os.path.exists(file1_path):
-            raise FileNotFoundError(f"File not found at {file1_path}")
-        if not os.path.exists(file2_path):
-            raise FileNotFoundError(f"File not found at {file2_path}")
-
-        output_dir = os.path.join(output_folder, "highlighted_excel_files")
-        os.makedirs(output_dir, exist_ok=True)
-
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-
-        update_status(f"Loading {file1_path}...")
-        global g_dfs1
-        g_dfs1 = pd_local.read_excel(file1_path, sheet_name=None) # Use pd_local
-        update_status(f"Loading {file2_path}...")
-        global g_dfs2
-        g_dfs2 = pd_local.read_excel(file2_path, sheet_name=None) # Use pd_local
-
-        timestamp = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-
-        file_to_highlight_path = ""
-        if output_choice == "file1":
-            file_to_highlight_path = file1_path
-            output_base_name = os.path.basename(file1_path).replace(".xlsx", "").replace(".xls", "")
-            output_file_name = f"{output_base_name}_{timestamp}_highlighted.xlsx"
-            df_to_save_dict = g_dfs1
-            wb_to_save = load_workbook(file1_path)
-            update_status(f"Selected to highlight: {os.path.basename(file1_path)}")
-        elif output_choice == "file2":
-            file_to_highlight_path = file2_path
-            output_base_name = os.path.basename(file2_path).replace(".xlsx", "").replace(".xls", "")
-            output_file_name = f"{output_base_name}_{timestamp}_highlighted.xlsx"
-            df_to_save_dict = g_dfs2
-            wb_to_save = load_workbook(file2_path)
-            update_status(f"Selected to highlight: {os.path.basename(file2_path)}")
-        else:
-            update_status("No output file chosen for highlighting.")
-            return
-
-        output_file_path = os.path.join(output_dir, output_file_name)
-
-        def extract_imo_like_numbers(dfs_dict):
-            numbers_set = set()
-            for sheet_name, df in dfs_dict.items():
-                if df.empty: continue
-                normalized_columns = {str(col).strip().lower(): col for col in df.columns}
-                
-                imo_candidate_cols = []
-                for pattern in IMO_LIKE_COLUMN_PATTERNS:
-                    for norm_col, orig_col in normalized_columns.items():
-                        if pattern in norm_col:
-                            original_col_name = next(col_orig for col_orig in df.columns if col_orig.strip().lower() == norm_col)
-                            imo_candidate_cols.append(original_col_name)
-                
-                for col_name in imo_candidate_cols:
-                    for val in df[col_name].dropna():
-                        cleaned_val = re.sub(r'\D', '', str(val)).strip() # Apply aggressive cleaning
-                        if re.fullmatch(r'^\d{7}$', cleaned_val):
-                            numbers_set.add(cleaned_val)
-            return numbers_set
-
-        imo_numbers_file1_set = extract_imo_like_numbers(g_dfs1)
-        imo_numbers_file2_set = extract_imo_like_numbers(g_dfs2)
-        
-        common_red_numbers = imo_numbers_file1_set.intersection(imo_numbers_file2_set)
-        excel_comparator_log_queue.put(f"[Excel Comparator] Found {len(common_red_numbers)} common 7-digit IMO numbers for highlighting.")
-
-        def apply_highlights(workbook, dataframes_dict, target_red_nums, red_fill, status_update):
-            for sheet_name, df in dataframes_dict.items():
-                if sheet_name not in workbook.sheetnames:
-                    status_update(f"Warning: Sheet '{sheet_name}' not found in workbook for highlighting. Skipping.")
-                    continue
-                ws = workbook[sheet_name]
-                
-                header_values = [cell.value for cell in ws[1]] # Assuming header is always in row 1
-                
-                imo_like_col_indices = []
-                for idx, cell_header_value in enumerate(header_values):
-                    if cell_header_value is not None and is_imo_like_column(str(cell_header_value)):
-                        imo_like_col_indices.append(idx)
-
-                for r_idx, row in enumerate(ws.iter_rows(min_row=2)): # Start from second row
-                    for c_idx, cell in enumerate(row):
-                        if c_idx in imo_like_col_indices:
-                            cell_value = cell.value
-                            if pd_local.notna(cell_value): # Use pd_local.notna
-                                # Apply identical aggressive cleaning here
-                                cleaned_cell_str_value = re.sub(r'\D', '', str(cell_value)).strip()
-                                
-                                # Diagnostic print for unhighlighted items that should be
-                                if cleaned_cell_str_value in target_red_nums and (cell.fill is None or cell.fill.bgColor.rgb != 'FFFF0000'):
-                                    excel_comparator_log_queue.put(f"DEBUG: MISSING HIGHLIGHT: Sheet='{sheet_name}', Row={r_idx+2}, Col={chr(65+c_idx)}, Raw='{cell_value}', Cleaned='{cleaned_cell_str_value}'")
-                                
-                                if re.fullmatch(r'^\d{7}$', cleaned_cell_str_value) and cleaned_cell_str_value in target_red_nums:
-                                    cell.fill = red_fill
-
-        update_status(f"Applying highlights to {os.path.basename(file_to_highlight_path)}...")
-        apply_highlights(wb_to_save, df_to_save_dict, common_red_numbers, red_fill, update_status)
-        
-        wb_to_save.save(output_file_path)
-        final_message = (f"Comparison complete. Highlighted file saved to:\n- {output_file_path}")
-
-        update_status(final_message)
-        excel_comparator_log_queue.put({'type': 'messagebox', 'kind': 'info', 'title': 'Success', 'message': final_message})
-    except Exception as e:
-        update_status(f"Error during comparison: {e}")
-        excel_comparator_log_queue.put({'type': 'messagebox', 'kind': 'error', 'title': 'Error', 'message': f"An error occurred during comparison: {e}"})
-    finally:
-        excel_comparator_log_queue.put({'type': 'processing_done'})
 
 
 # --- SanctionsAppFrame (Program 1 GUI encapsulated) ---
 class SanctionsAppFrame(ttk.Frame):
-    def __init__(self, parent):
+    def __init__(self, parent, sanctions_display_callback): # Added display callback
         super().__init__(parent)
         self.is_processing = False
-        self.excel_comparator_file1_callback = None # Callback to update ExcelComparator's file1 entry
+        self.sanctions_display_callback = sanctions_display_callback # Callback to update SanctionsDisplayFrame
         self.automatic_generation_complete_callback = None # New: Callback for automatic runs
 
         self.BG_COLOR = "#002060"
@@ -665,6 +596,7 @@ class SanctionsAppFrame(ttk.Frame):
         self.progress_canvas.pack(pady=10, fill=tk.X)
         self.pulse_rect = None
 
+        # Corrected: Use main_content_frame here for log_frame (Fixes NameError)
         log_frame = ttk.LabelFrame(main_content_frame, text="Log Output", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         
@@ -682,30 +614,23 @@ class SanctionsAppFrame(ttk.Frame):
         self.after(100, self.process_gui_queue)
 
     def set_excel_comparator_file1_callback(self, callback):
-        """Sets the callback function to update ExcelComparator's file1 field."""
-        self.excel_comparator_file1_callback = callback
+        """No longer used directly as ExcelComparator is removed. Kept for compatibility if external references exist."""
+        pass # This callback is now effectively a no-op or can be removed if not called elsewhere.
 
     def start_processing_thread(self, on_complete_override=None):
         """
         Starts the report generation thread.
-        Can be triggered manually (on_complete_override=None) or automatically.
+        Now calls process_all_data without output_filepath and passes display_callback.
         """
-        output_filepath = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], title="Save Sanctions Report As", initialfile="Sanctions_Report.xlsx")
-        if not output_filepath:
-            log_to_gui_and_console("File save cancelled.")
-            if on_complete_override:
-                on_complete_override(None) # Signal cancellation
-            return
-
+        # No file dialog needed as output is in-app
+        
         self.is_processing = True
         self.run_button.config(state=tk.DISABLED)
         
         # Initialize progress_bar BEFORE animate_pulse and ensure it has a size
         self.progress_canvas.delete("progress_background") # Clear old background
         self.progress_canvas.delete("progress_bar") # Clear any old bar
-        # Create background rectangle
         self.progress_canvas.create_rectangle(0, 0, self.progress_canvas.winfo_width(), 25, fill=self.FRAME_COLOR, outline="", tags="progress_background")
-        # Create actual progress bar (initially zero width)
         self.progress_canvas.create_rectangle(0, 0, 0, 25, fill=self.ACCENT_COLOR, outline="", tags="progress_bar")
         self.master.update_idletasks() # Force update to ensure 'progress_bar' exists before animation starts
         time.sleep(0.01) # Small delay to help ensure canvas update
@@ -713,22 +638,23 @@ class SanctionsAppFrame(ttk.Frame):
         self.update_progress(0, 7) # Initialize visual progress
         self.log_area.config(state='normal'); self.log_area.delete('1.0', tk.END); self.log_area.config(state='disabled')
         
-        # Use provided callback, or default to updating Excel comparator
-        callback_to_use = on_complete_override if on_complete_override else self.excel_comparator_file1_callback
-        threading.Thread(target=process_all_data, args=(output_filepath, callback_to_use,), daemon=True).start()
+        # Pass the sanctions_display_callback to process_all_data
+        threading.Thread(target=process_all_data, 
+                         args=(on_complete_override, self.sanctions_display_callback,), 
+                         daemon=True).start()
         self.animate_pulse()
 
     def start_automatic_generation(self, callback_after_generation):
         """Public method to trigger a report generation automatically."""
         self.automatic_generation_complete_callback = callback_after_generation
-        # Use a dummy filepath (won't be directly used, but needed for file dialog context)
-        dummy_filepath = os.path.join(os.getcwd(), "Sanctions_Report.xlsx")
+        # No dummy filepath needed anymore.
         self.start_processing_thread(on_complete_override=self._automatic_generation_complete)
 
-    def _automatic_generation_complete(self, filepath):
+    def _automatic_generation_complete(self, success_status): # Changed parameter to success_status
         """Internal callback for automatic generation completion."""
         if self.automatic_generation_complete_callback:
-            self.automatic_generation_complete_callback(filepath)
+            # Pass success status, not a file path
+            self.automatic_generation_complete_callback(success_status) 
         self.automatic_generation_complete_callback = None # Clear callback
 
     def update_progress(self, value, max_val):
@@ -753,17 +679,17 @@ class SanctionsAppFrame(ttk.Frame):
             self.progress_canvas.delete(self.pulse_rect)
 
         self.pulse_rect = self.progress_canvas.create_rectangle(x_pos, 0, x_pos + pulse_width, 25, fill=self.PULSE_COLOR, tags="pulse", outline="")
-        self.progress_canvas.tag_raise("pulse", "progress_bar") # Ensure pulse is on top of the bar
+        self.progress_canvas.tag_raise("pulse", "progress_bar") # Ensure pulse is on top of bar
         
         new_x = x_pos + 5 * direction
         if new_x > canvas_width or new_x < -pulse_width:
-             new_x = -pulse_width if direction == 1 else canvas_width
+              new_x = -pulse_width if direction == 1 else canvas_width
         
         self.after(15, lambda: self.animate_pulse(new_x, direction))
 
     def update_log(self, message):
         self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, message) # Message already has newline from TextRedirector.write
+        self.log_area.insert(tk.END, message)
         self.log_area.see(tk.END)
         self.log_area.config(state='disabled')
 
@@ -786,89 +712,92 @@ class SanctionsAppFrame(ttk.Frame):
             self.after(100, self.process_gui_queue)
 
 
-# --- ExcelComparatorFrame ---
-class ExcelComparatorFrame(ttk.Frame):
+# --- SanctionsDisplayFrame (NEW TAB for displaying fetched data) ---
+class SanctionsDisplayFrame(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
-        self.is_processing = False
-        self.file1_path = tk.StringVar()
-        self.file2_path = tk.StringVar()
-        self.output_file_choice = tk.StringVar(value="file1")
+        self.current_data = {} # Stores the DataFrames to display
+        self.notebook_tabs = [] # To keep track of dynamically created tabs
+        self.current_selected_data_source = tk.StringVar(value="All Data (Combined)") # Default selection
 
         self.BG_COLOR = "#F0F0F0"
         self.TEXT_COLOR = "#333333"
+        self.FRAME_BG_COLOR = "#FFFFFF"
         self.BUTTON_COLOR = "#0056B3"
         self.BUTTON_TEXT_COLOR = "white"
-        self.FRAME_BG_COLOR = "#FFFFFF"
 
         self.style = ttk.Style(self)
         self.style.configure('TFrame', background=self.BG_COLOR)
         self.style.configure('TLabelframe', background=self.FRAME_BG_COLOR, bordercolor="#AAAAAA", relief="groove", borderwidth=1)
         self.style.configure('TLabelframe.Label', background=self.FRAME_BG_COLOR, foreground="#555555", font=("Arial", 11, "bold"))
-        
-        self.style.configure('TLabel', background=self.FRAME_BG_COLOR, foreground=self.TEXT_COLOR, font=("Arial", 10))
-        self.style.configure('TRadiobutton', background=self.FRAME_BG_COLOR, foreground=self.TEXT_COLOR, font=("Arial", 10))
-        
-        self.style.configure('Excel.TButton', background=self.BUTTON_COLOR, foreground=self.BUTTON_TEXT_COLOR,
+        self.style.configure("Treeview",
+                             background="#F8F8F8",
+                             foreground=self.TEXT_COLOR,
+                             rowheight=25,
+                             fieldbackground="#F8F8F8",
+                             font=("Arial", 10))
+        self.style.configure("Treeview.Heading",
+                             font=("Arial", 10, "bold"),
+                             background="#DDDDDD",
+                             foreground="#333333",
+                             relief="raised")
+        self.style.configure('Display.TButton', background=self.BUTTON_COLOR, foreground=self.BUTTON_TEXT_COLOR,
                              font=("Arial", 10, "bold"), relief="raised", borderwidth=2)
-        self.style.map('Excel.TButton', background=[('active', '#004085')])
+        self.style.map('Display.TButton', background=[('active', '#004085')])
 
         main_frame = ttk.Frame(self, padding="20", style='TFrame')
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        file_frame = ttk.LabelFrame(main_frame, text="Select Excel Files", padding=(15,10))
-        file_frame.pack(pady=10, fill=tk.X)
+        controls_frame = ttk.LabelFrame(main_frame, text="Report Viewer Controls", padding=(15,10))
+        controls_frame.pack(pady=10, fill=tk.X)
 
-        ttk.Label(file_frame, text="Baseline Excel File:").grid(row=0, column=0, sticky="w", pady=5)
-        self.entry1 = ttk.Entry(file_frame, textvariable=self.file1_path, width=60)
-        self.entry1.grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=lambda: self.browse_file(self.file1_path), style='Excel.TButton').grid(row=0, column=2, padx=5, pady=5)
+        ttk.Label(controls_frame, text="Select Data Source:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.source_selector = ttk.Combobox(controls_frame, textvariable=self.current_selected_data_source, state="readonly", width=30)
+        self.source_selector.grid(row=0, column=1, padx=5, pady=5)
+        self.source_selector.bind("<<ComboboxSelected>>", self.display_selected_source)
+        self.source_selector['values'] = ["No Data Available"] # Default value
 
-        ttk.Label(file_frame, text="Comparison Excel File:").grid(row=1, column=0, sticky="w", pady=5)
-        self.entry2 = ttk.Entry(file_frame, textvariable=self.file2_path, width=60)
-        self.entry2.grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=lambda: self.browse_file(self.file2_path), style='Excel.TButton').grid(row=1, column=2, padx=5, pady=5)
+        # Define methods that will be assigned to buttons BEFORE the buttons are created
+        self.export_current_view = self._export_current_view_method
+        self.clear_display = self._clear_display_method
+        self.load_uani_data_from_file = self._load_uani_data_from_file_method # New: UANI manual load method
 
-        output_frame = ttk.LabelFrame(main_frame, text="Choose Output File for Highlighting", padding=(15,10))
-        output_frame.pack(pady=10, fill=tk.X)
-        ttk.Radiobutton(output_frame, text="Highlight Baseline File", variable=self.output_file_choice, value="file1", style='TRadiobutton').pack(anchor="w")
-        ttk.Radiobutton(output_frame, text="Highlight Comparison File", variable=self.output_file_choice, value="file2", style='TRadiobutton').pack(anchor="w")
+        self.export_button = ttk.Button(controls_frame, text="Export Current View to Excel", command=self.export_current_view, style='Display.TButton')
+        self.export_button.grid(row=0, column=2, padx=10, pady=5)
+        self.export_button.config(state=tk.DISABLED) # Disable until data is loaded
 
-        self.compare_button = ttk.Button(main_frame, text="Compare and Highlight", command=self.run_comparison_threaded, style='Excel.TButton')
-        self.compare_button.pack(pady=15)
+        self.clear_button = ttk.Button(controls_frame, text="Clear All Displayed Data", command=self.clear_display, style='Display.TButton')
+        self.clear_button.grid(row=0, column=3, padx=10, pady=5)
+        
+        # New: UANI Manual Load Button
+        self.load_uani_button = ttk.Button(controls_frame, text="Load UANI Data from File", command=self.load_uani_data_from_file, style='Display.TButton')
+        self.load_uani_button.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
-        search_frame = ttk.LabelFrame(main_frame, text="Search Numeric Values", padding=(15,10))
-        search_frame.pack(pady=10, fill=tk.X)
 
-        ttk.Label(search_frame, text="Search Number:").grid(row=0, column=0, sticky="w", pady=5)
-        self.search_entry = ttk.Entry(search_frame, width=30)
-        self.search_entry.grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(search_frame, text="Search", command=self.perform_search, style='Excel.TButton').grid(row=0, column=2, padx=5, pady=5)
+        self.tree_frame = ttk.Frame(main_frame, style='TFrame')
+        self.tree_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
+        # Treeview setup for displaying data
+        self.treeview = ttk.Treeview(self.tree_frame)
+        self.treeview.pack(side="left", fill="both", expand=True)
+        
+        tree_scroll_y = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.treeview.yview)
+        tree_scroll_y.pack(side="right", fill="y")
+        self.treeview.configure(yscrollcommand=tree_scroll_y.set)
+
+        tree_scroll_x = ttk.Scrollbar(self.tree_frame, orient="horizontal", command=self.treeview.xview)
+        tree_scroll_x.pack(side="bottom", fill="x")
+        self.treeview.configure(xscrollcommand=tree_scroll_x.set)
+        
         ttk.Label(main_frame, text="Status:", background=self.BG_COLOR, foreground=self.TEXT_COLOR).pack(anchor="w", padx=10)
-        self.status_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=70, height=10, font=("Consolas", 9),
+        self.status_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=3, font=("Consolas", 9),
                                                      bg=self.FRAME_BG_COLOR, fg=self.TEXT_COLOR, relief=tk.FLAT)
-        self.status_text.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
-        self.status_text.insert(tk.END, "Ready to compare and search Excel files.\n")
+        self.status_text.pack(padx=10, pady=5, fill=tk.X, expand=False)
+        self.status_text.insert(tk.END, "Awaiting sanctions report data...\n")
         self.status_text.config(state=tk.DISABLED)
 
-        footnote_label = ttk.Label(main_frame, text="For any problems or queries, please contact: it@rcsclass.org",
-                                     background=self.BG_COLOR, foreground="#666666", font=("Arial", 9, "italic"))
-        footnote_label.pack(side=tk.BOTTOM, pady=(10, 0))
+        self.after(100, self.process_sanctions_display_queue)
 
-        self.after(100, self.process_excel_comparator_queue)
-
-    def set_file1_path(self, filepath):
-        self.file1_path.set(filepath)
-        self.update_status_text(f"Sanctions report output loaded as Baseline Excel File: {filepath}\n")
-
-    def browse_file(self, path_var):
-        filepath = filedialog.askopenfilename(
-            filetypes=[("Excel files", "*.xlsx *.xls")]
-        )
-        if filepath:
-            path_var.set(filepath)
-            self.update_status_text(f"Selected: {filepath}\n")
 
     def update_status_text(self, message):
         self.status_text.config(state='normal')
@@ -876,110 +805,206 @@ class ExcelComparatorFrame(ttk.Frame):
         self.status_text.see(tk.END)
         self.status_text.config(state='disabled')
 
-    def run_comparison_threaded(self):
-        file1 = self.file1_path.get()
-        file2 = self.file2_path.get()
-        output_choice = self.output_file_choice.get()
-
-        if not file1 or not file2:
-            messagebox.showwarning("Missing Files", "Please select both Excel files.")
-            self.update_status_text("Error: Please select both Excel files.\n")
-            return
+    def display_data(self, fetched_data_dict):
+        self.current_data = fetched_data_dict
+        available_sources = ["All Data (Combined)"] + [key for key, df in fetched_data_dict.items() if df is not None and not df.empty]
+        self.source_selector['values'] = available_sources
+        self.current_selected_data_source.set("All Data (Combined)")
         
-        output_folder = filedialog.askdirectory(title="Select Output Folder for Highlighted Files")
-        if not output_folder:
-            self.update_status_text("Output folder selection cancelled.\n")
-            return
+        self.export_button.config(state=tk.NORMAL)
+        self.display_selected_source() # Display the combined data by default
+        self.update_status_text(f"New sanctions report data loaded. {len(available_sources)-1} sources available.\n")
 
-        self.update_status_text("Comparison initiated...\n")
-        self.is_processing = True
-        self.compare_button.config(state=tk.DISABLED)
-        self.search_entry.config(state=tk.DISABLED)
-        threading.Thread(target=compare_and_highlight_excel_threaded, args=(file1, file2, output_choice, output_folder, self.update_status_text), daemon=True).start()
+    def display_selected_source(self, event=None):
+        selected_source = self.current_selected_data_source.get()
+        self.clear_treeview()
 
-    def perform_search(self):
-        search_term_str = self.search_entry.get().strip()
-        if not search_term_str:
-            messagebox.showwarning("Search Input", "Please enter a number to search.")
-            self.update_status_text("Please enter a number to search.\n")
-            return
-
-        if not re.fullmatch(r'\d+', search_term_str):
-            messagebox.showwarning("Invalid Input", "Please enter a valid whole number for search.")
-            self.update_status_text("Invalid input for search. Please enter a whole number.\n")
-            return
+        df_to_display = pd.DataFrame()
         
-        search_num_str = search_term_str
-
-        self.update_status_text(f"\nSearching for '{search_num_str}' (numeric only)...\n")
-        
-        if not g_dfs1 and not g_dfs2:
-            self.status_text.config(state='normal')
-            self.status_text.insert(tk.END, "No Excel files loaded for search. Please run comparison first.\n")
-            self.status_text.config(state='disabled')
-            return
-
-        found_in_file1 = []
-        found_in_file2 = []
-
-        def search_df(dfs_dict, search_val_str, filename):
-            found_locations = []
-            for sheet_name, df in dfs_dict.items():
-                if df.empty: continue
-                for r_idx, row_series in df.iterrows():
-                    for c_idx, cell_value in enumerate(row_series):
-                        if pd.notna(cell_value):
-                            cleaned_cell_val = re.sub(r'\D', '', str(cell_value)).strip()
-                            if cleaned_cell_val == search_val_str:
-                                found_locations.append(f"Sheet: '{sheet_name}', Row: {r_idx + 2}, Column Index: {c_idx} (Excel Column: {chr(65 + c_idx)})")
-                
-                for c_idx, col_name in enumerate(df.columns):
-                    if pd.notna(col_name):
-                        cleaned_col_name = re.sub(r'\D', '', str(col_name)).strip()
-                        if cleaned_col_name == search_val_str:
-                            found_locations.append(f"Sheet: '{sheet_name}', Header Row: 1, Column Index: {c_idx} (Excel Column: {chr(65 + c_idx)}) (Header)")
-            return found_locations
-
-        found_in_file1 = search_df(g_dfs1, search_num_str, os.path.basename(self.file1_path.get()))
-        found_in_file2 = search_df(g_dfs2, search_num_str, os.path.basename(self.file2_path.get()))
-
-        if found_in_file1:
-            self.update_status_text(f"Found in Baseline Excel File ({os.path.basename(self.file1_path.get())}):\n" + "\n".join(found_in_file1) + "\n")
+        if selected_source == "All Data (Combined)":
+            all_dfs = []
+            for source_name, df in self.current_data.items():
+                if df is not None and not df.empty:
+                    df_copy = df.copy()
+                    if 'Source' not in df_copy.columns:
+                        df_copy['Source'] = source_name # Add source column if not present
+                    all_dfs.append(df_copy)
+            if all_dfs:
+                df_to_display = pd.concat(all_dfs, ignore_index=True)
+                # Ensure 'IMO Number' is string for robust duplicate dropping
+                if 'IMO Number' in df_to_display.columns:
+                    df_to_display['IMO Number'] = df_to_display['IMO Number'].astype(str)
+                    df_to_display.drop_duplicates(subset=['IMO Number'], keep='first', inplace=True)
+            self.update_status_text(f"Displaying combined data: {len(df_to_display)} unique vessels.\n")
+        elif selected_source in self.current_data and self.current_data[selected_source] is not None:
+            df_to_display = self.current_data[selected_source].copy()
+            self.update_status_text(f"Displaying {selected_source}: {len(df_to_display)} records.\n")
         else:
-            self.update_status_text(f"'{search_num_str}' not found in Baseline Excel File (numeric only).\n")
+            self.update_status_text(f"No data available for {selected_source}.\n")
+            return
 
-        if found_in_file2:
-            self.update_status_text(f"Found in Comparison Excel File ({os.path.basename(self.file2_path.get())}):\n" + "\n".join(found_in_file2) + "\n")
+        if not df_to_display.empty:
+            self.treeview["columns"] = list(df_to_display.columns)
+            self.treeview["show"] = "headings"
+
+            for col in df_to_display.columns:
+                self.treeview.heading(col, text=col)
+                # Adjust column width based on content
+                max_len = max(df_to_display[col].astype(str).map(len).max(), len(col))
+                self.treeview.column(col, width=max_len * 9 + 10) # Approx width based on characters
+            
+            for index, row in df_to_display.iterrows():
+                self.treeview.insert("", "end", values=list(row.values))
         else:
-            self.update_status_text(f"'{search_num_str}' not found in Comparison Excel File (numeric only).\n")
+            self.update_status_text("Selected data source is empty.\n")
+            self.clear_treeview()
 
-    def process_excel_comparator_queue(self):
+
+    def clear_treeview(self):
+        self.treeview.delete(*self.treeview.get_children())
+        self.treeview["columns"] = () # Clear columns
+        self.treeview["show"] = "tree headings" # Reset to default if no columns
+        self.update_status_text("Display cleared.\n")
+
+    def _clear_display_method(self): # Actual method for clear_display
+        self.current_data = {}
+        self.clear_treeview()
+        self.source_selector['values'] = ["No Data Available"]
+        self.current_selected_data_source.set("No Data Available")
+        self.export_button.config(state=tk.DISABLED)
+        self.update_status_text("All displayed sanctions data cleared.\n")
+        global global_sanctions_data_store
+        for key in global_sanctions_data_store:
+            global_sanctions_data_store[key] = None
+
+    def _export_current_view_method(self): # Actual method for export_current_view
+        selected_source = self.current_selected_data_source.get()
+        df_to_export = pd.DataFrame()
+
+        if selected_source == "All Data (Combined)":
+            all_dfs = []
+            for source_name, df in self.current_data.items():
+                if df is not None and not df.empty:
+                    df_copy = df.copy()
+                    if 'Source' not in df_copy.columns:
+                        df_copy['Source'] = source_name
+                    all_dfs.append(df_copy)
+            if all_dfs:
+                df_to_export = pd.concat(all_dfs, ignore_index=True)
+                if 'IMO Number' in df_to_export.columns:
+                    df_to_export['IMO Number'] = df_to_export['IMO Number'].astype(str)
+                    df_to_export.drop_duplicates(subset=['IMO Number'], keep='first', inplace=True)
+        elif selected_source in self.current_data and self.current_data[selected_source] is not None:
+            df_to_export = self.current_data[selected_source].copy()
+        
+        if df_to_export.empty:
+            messagebox.showwarning("Export Warning", "No data to export in the current view.")
+            return
+
+        timestamp = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        initial_filename = f"Sanctions_Report_View_{selected_source.replace(' ', '_').replace('(', '').replace(')', '')}_{timestamp}.xlsx"
+
+        output_filepath = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], title="Export Current View As", initialfile=initial_filename)
+        
+        if output_filepath:
+            try:
+                # Import pandas inside this function to ensure it's available in the thread
+                import pandas as pd_local 
+                df_to_export.to_excel(output_filepath, index=False)
+                messagebox.showinfo("Export Successful", f"Current view exported to:\n{output_filepath}")
+                self.update_status_text(f"Current view exported to: {output_filepath}\n")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export data: {e}")
+                self.update_status_text(f"Error exporting data: {e}\n")
+        else:
+            self.update_status_text("Export cancelled.\n")
+
+    def _load_uani_data_from_file_method(self):
+        """Allows user to manually load a CSV into the UANI sanctions data, persisting it."""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if not filepath:
+            self.update_status_text("UANI CSV load cancelled by user.\n")
+            return
+
+        self.update_status_text(f"Attempting to load UANI data from user-selected file: {filepath}\n")
+        
         try:
-            while not excel_comparator_log_queue.empty():
-                item = excel_comparator_log_queue.get_nowait()
-                if isinstance(item, dict) and item.get('type') == 'messagebox':
-                    if item['kind'] == 'info': messagebox.showinfo(item['title'], item['message'])
-                    elif item['kind'] == 'error': messagebox.showerror(item['title'], item['message'])
-                elif isinstance(item, dict) and item.get('type') == 'processing_done':
-                    self.is_processing = False
-                    self.compare_button.config(state=tk.NORMAL)
-                    self.search_entry.config(state=tk.NORMAL)
-                else:
-                    self.update_status_text(item + "\n")
+            import pandas as pd_local # Ensure pandas is available in this scope
+            df_loaded = pd_local.read_csv(filepath)
+
+            # Normalize column names in the loaded DataFrame
+            original_columns = list(df_loaded.columns)
+            cleaned_columns_map = {str(col).strip().lower(): col for col in original_columns}
+            
+            imo_col_key = None
+            name_col_key = None
+
+            for pattern in ['imo', 'imo number', 'imo no']:
+                if pattern in cleaned_columns_map:
+                    imo_col_key = cleaned_columns_map[pattern]
+                    break
+            
+            for pattern in ['vessel name', 'vessel', 'name']:
+                if pattern in cleaned_columns_map:
+                    name_col_key = cleaned_columns_map[pattern]
+                    break
+            
+            if imo_col_key and name_col_key:
+                df_uani = df_loaded[[name_col_key, imo_col_key]].copy()
+                df_uani.rename(columns={name_col_key: "Vessel Name", imo_col_key: "IMO Number"}, inplace=True)
+                df_uani["Source"] = "UANI (Manual File)"
+                df_uani.dropna(subset=["IMO Number"], inplace=True)
+                df_uani["IMO Number"] = df_uani["IMO Number"].astype(str).apply(lambda x: re.sub(r'\D', '', str(x)))
+                df_uani = df_uani[df_uani['IMO Number'].str.match(r'^\d{7}$')]
+                
+                # Update global store
+                global global_sanctions_data_store
+                global_sanctions_data_store["UANI_Vessels_Tracked"] = df_uani
+                
+                # Save to the bundled CSV location for persistence
+                try:
+                    # Get the directory where the main executable/script is located
+                    app_dir = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
+                    persist_path = os.path.join(app_dir, UANI_BUNDLED_CSV_NAME)
+                    df_uani.to_csv(persist_path, index=False, encoding='utf-8')
+                    self.update_status_text(f"UANI data successfully loaded from file and saved to {UANI_BUNDLED_CSV_NAME} for persistence.\n")
+                except Exception as save_e:
+                    self.update_status_text(f"WARNING: Could not save UANI data to {UANI_BUNDLED_CSV_NAME} for persistence: {save_e}. Data loaded but not saved for next session.\n")
+
+                self.display_data(global_sanctions_data_store) # Refresh display
+                messagebox.showinfo("UANI Load Success", f"UANI data loaded and displayed from: {filepath}")
+            else:
+                self.update_status_text(f"ERROR: Selected UANI CSV '{filepath}' missing 'IMO' or 'Vessel Name' columns after cleaning. Found headers: {df_loaded.columns.tolist()}\n")
+                messagebox.showerror("UANI Load Error", "Selected UANI CSV file format is incorrect. Missing 'IMO' or 'Vessel Name' columns.")
+
+        except Exception as e:
+            self.update_status_text(f"ERROR: Failed to load UANI data from file {filepath}: {e}. Traceback: {sys.exc_info()}\n")
+            messagebox.showerror("UANI Load Error", f"An error occurred while loading UANI data from file: {e}")
+
+    def process_sanctions_display_queue(self):
+        try:
+            while not sanctions_display_queue.empty():
+                item = sanctions_display_queue.get_nowait()
+                msg_type = item.get('type')
+                if msg_type == 'display_data':
+                    self.display_data(item['data'])
+                elif msg_type == 'update_status':
+                    self.update_status_text(item['message'])
         finally:
-            self.after(100, self.process_excel_comparator_queue)
+            self.after(100, self.process_sanctions_display_queue)
 
 
 # --- MyVesselsAppFrame (New Tab) ---
 MY_VESSELS_CSV = "my_vessels.csv"
 
 class MyVesselsAppFrame(ttk.Frame):
-    def __init__(self, parent, get_last_sanctions_report_path_callback):
+    def __init__(self, parent, get_last_sanctions_data_callback): # Renamed callback
         super().__init__(parent)
-        self.get_last_sanctions_report_path = get_last_sanctions_report_path_callback
+        self.get_last_sanctions_data = get_last_sanctions_data_callback # Callback to get in-memory data
         self.vessels_data = [] # List of {'name': 'Vessel Name', 'imo': 'IMO Number'} dicts
-        self.load_vessels_from_csv()
-
+        
         # Stores sanctioned IMO numbers from the last report run
         self.sanctioned_imos_from_report = set()
         # Stores {IMO: [Source1, Source2]} for sanctioned vessels
@@ -1082,8 +1107,8 @@ class MyVesselsAppFrame(ttk.Frame):
 
 
         tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.vessel_tree.yview)
-        self.vessel_tree.configure(yscrollcommand=tree_scroll.set)
         tree_scroll.pack(side="right", fill="y")
+        self.vessel_tree.configure(yscrollcommand=tree_scroll.set)
         self.vessel_tree.pack(fill="both", expand=True)
 
         remove_button = ttk.Button(list_frame, text="Remove Selected Vessel(s)", command=self.remove_selected_vessels, style='MyVessels.TButton')
@@ -1093,29 +1118,93 @@ class MyVesselsAppFrame(ttk.Frame):
         export_button = ttk.Button(main_frame, text="Export My Vessels to Excel", command=self.export_my_vessels, style='MyVessels.TButton')
         export_button.pack(pady=10, fill=tk.X)
 
-
+        # --- MOVED THIS BLOCK UP (within MyVesselsAppFrame init) ---
         ttk.Label(main_frame, text="Status:", background=self.BG_COLOR, foreground=self.TEXT_COLOR).pack(anchor="w", padx=10)
         self.status_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=5, font=("Consolas", 9),
                                                      bg=self.FRAME_BG_COLOR, fg=self.TEXT_COLOR, relief=tk.FLAT)
         self.status_text.pack(padx=10, pady=5, fill=tk.X, expand=False)
         self.status_text.insert(tk.END, "Manage your personal vessel list here.\n")
         self.status_text.config(state=tk.DISABLED)
+        # --- END MOVED BLOCK ---
 
-        self.populate_vessel_tree() # Initial population
+        # New "Load CSV" button
+        load_csv_button = ttk.Button(main_frame, text="Load Vessels from CSV", command=self.prompt_load_custom_vessels_csv, style='MyVessels.TButton')
+        load_csv_button.pack(pady=10, fill=tk.X)
+
+        self.load_vessels_from_csv() # Initial population - NOW status_text exists
         self.after(100, self.process_my_vessels_queue) # Start queue processing
 
+    def _load_vessels_from_file(self, file_path):
+        """Helper to load vessels from a specified CSV file, used internally."""
+        temp_vessels_data = [] # Use a temporary list for loading
+        self.update_status_text(f"Attempting to load vessels from: {file_path}\n")
+
+        if not os.path.exists(file_path):
+            self.update_status_text(f"File not found: {file_path}. Please ensure it exists and is accessible.\n")
+            return False # Indicate failure
+
+        try:
+            with open(file_path, mode='r', newline='', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                
+                if reader.fieldnames:
+                    # Log raw and stripped fieldnames for debugging
+                    self.update_status_text(f"CSV Raw Fieldnames: {reader.fieldnames}\n")
+                    reader.fieldnames = [field.strip() for field in reader.fieldnames]
+                    self.update_status_text(f"CSV Stripped Fieldnames: {reader.fieldnames}\n")
+
+                if reader.fieldnames is None:
+                    self.update_status_text("CSV file has no headers. Expected 'name' and 'imo'.\n")
+                    return False
+                
+                if 'name' not in reader.fieldnames or 'imo' not in reader.fieldnames:
+                    self.update_status_text(f"CSV headers missing 'name' or 'imo'. Found: {reader.fieldnames}\n")
+                    return False
+
+                read_count = 0
+                for row_idx, row in enumerate(reader):
+                    # Create a cleaned_row dictionary with stripped keys for reliable access
+                    cleaned_row = {k.strip(): v for k, v in row.items()}
+                    
+                    if 'name' in cleaned_row and 'imo' in cleaned_row:
+                        temp_vessels_data.append({'name': cleaned_row['name'], 'imo': cleaned_row['imo']})
+                        read_count += 1
+                        if read_count <= 5: # Log first five rows for debugging
+                            self.update_status_text(f"Read row {row_idx+1}: Name='{cleaned_row['name']}', IMO='{cleaned_row['imo']}'\n")
+                    else:
+                        self.update_status_text(f"Skipping row {row_idx+1} due to missing 'name' or 'imo' fields: {row}\n")
+
+            # If loading successful, update the main vessels_data list
+            self.vessels_data = temp_vessels_data
+            self.update_status_text(f"Successfully loaded {len(self.vessels_data)} vessels from {file_path}.\n")
+            self.populate_vessel_tree(search_term=self.search_vessel_entry.get()) # Refresh display
+            self.save_vessels_to_csv() # Save the newly loaded list
+            return True
+
+        except Exception as e:
+            self.update_status_text(f"Error loading vessels from CSV: {e}. Please check the file's integrity and permissions.\n")
+            print(f"DEBUG: Exception in _load_vessels_from_file: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def load_vessels_from_csv(self):
-        self.vessels_data = []
-        if os.path.exists(MY_VESSELS_CSV):
-            try:
-                with open(MY_VESSELS_CSV, mode='r', newline='', encoding='utf-8') as file:
-                    reader = csv.DictReader(file)
-                    for row in reader:
-                        if 'name' in row and 'imo' in row:
-                            self.vessels_data.append({'name': row['name'], 'imo': row['imo']})
-            except Exception as e:
-                my_vessels_log_queue.put(f"Error loading vessels from CSV: {e}")
-        my_vessels_log_queue.put(f"Loaded {len(self.vessels_data)} vessels from {MY_VESSELS_CSV}")
+        """Loads vessels from the default MY_VESSELS_CSV file on startup."""
+        self._load_vessels_from_file(MY_VESSELS_CSV)
+
+    def prompt_load_custom_vessels_csv(self):
+        """Opens a file dialog for the user to select a CSV to load."""
+        filepath = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv")]
+        )
+        if filepath:
+            self.update_status_text(f"User selected: {filepath}\n")
+            if self._load_vessels_from_file(filepath):
+                messagebox.showinfo("Load Successful", f"Vessels loaded successfully from:\n{filepath}")
+            else:
+                messagebox.showerror("Load Failed", f"Failed to load vessels from:\n{filepath}\nCheck status messages for details.")
+        else:
+            self.update_status_text("CSV file load cancelled by user.\n")
 
     def save_vessels_to_csv(self):
         try:
@@ -1124,9 +1213,14 @@ class MyVesselsAppFrame(ttk.Frame):
                 writer = csv.DictWriter(file, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.vessels_data)
-            my_vessels_log_queue.put(f"Saved {len(self.vessels_data)} vessels to {MY_VESSELS_CSV}")
+            self.update_status_text(f"Saved {len(self.vessels_data)} vessels to {MY_VESSELS_CSV}.\n")
+            print(f"DEBUG: Successfully saved {len(self.vessels_data)} vessels to {MY_VESSELS_CSV}") # Console log
         except Exception as e:
-            my_vessels_log_queue.put(f"Error saving vessels to CSV: {e}")
+            error_message = f"Error saving vessels to CSV: {e}"
+            self.update_status_text(f"ERROR: {error_message}. Please check file permissions or if another process is using 'my_vessels.csv'.\n")
+            print(f"DEBUG: Error during save_vessels_to_csv: {e}") # Console log
+            import traceback
+            traceback.print_exc() # Print full traceback to console
 
     def populate_vessel_tree(self, search_term=""):
         """Populates the Treeview, optionally filtering by search_term and applying highlights."""
@@ -1216,48 +1310,52 @@ class MyVesselsAppFrame(ttk.Frame):
         initial_filename = f"My_Vessels_List_{timestamp}.xlsx"
 
         output_filepath = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], title="Export My Vessels As", initialfile=initial_filename)
-        if not output_filepath:
+        
+        if output_filepath:
+            try:
+                # Import pandas inside this function to ensure it's available in the thread
+                import pandas as pd_local 
+
+                # Create a DataFrame that matches the Treeview's displayed columns
+                export_data = []
+                for item_id in self.vessel_tree.get_children():
+                    # Extract values as they appear in the Treeview, including No., Sanctioned?, Sources
+                    values = self.vessel_tree.item(item_id, 'values')
+                    export_data.append({
+                        "No.": values[0],
+                        "Vessel Name": values[1],
+                        "IMO Number": values[2],
+                        "Sanctioned?": values[3],
+                        "Sources": values[4]
+                    })
+                df = pd_local.DataFrame(export_data) # Use pd_local
+                
+                df.to_excel(output_filepath, index=False)
+                messagebox.showinfo("Export Successful", f"My Vessels list exported to:\n{output_filepath}")
+                self.update_status_text(f"My Vessels list exported to: {output_filepath}\n")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to export vessels: {e}")
+                self.update_status_text(f"Error exporting vessels: {e}\n")
+        else:
             self.update_status_text("Export cancelled.\n")
-            return
-
-        try:
-            # Import pandas inside this function to ensure it's available in the thread
-            import pandas as pd_local 
-
-            # Create a DataFrame that matches the Treeview's displayed columns
-            export_data = []
-            for item_id in self.vessel_tree.get_children():
-                # Extract values as they appear in the Treeview, including No., Sanctioned?, Sources
-                values = self.vessel_tree.item(item_id, 'values')
-                export_data.append({
-                    "No.": values[0],
-                    "Vessel Name": values[1],
-                    "IMO Number": values[2],
-                    "Sanctioned?": values[3],
-                    "Sources": values[4]
-                })
-            df = pd_local.DataFrame(export_data) # Use pd_local
-            
-            df.to_excel(output_filepath, index=False)
-            messagebox.showinfo("Export Successful", f"My Vessels list exported to:\n{output_filepath}")
-            self.update_status_text(f"My Vessels list exported to: {output_filepath}\n")
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export vessels: {e}")
-            self.update_status_text(f"Error exporting vessels: {e}\n")
 
     def compare_my_vessels_threaded(self):
         """
-        Initiates the sanctions check for My Vessels.
-        Does NOT automatically trigger report generation. User must generate report separately.
+        Initiates the sanctions check for My Vessels against the in-memory report.
         """
         if not self.vessels_data:
             messagebox.showinfo("No Vessels", "Please add vessels to 'My Vessels' list before checking sanctions.")
             return
 
-        sanctions_report_path = self.get_last_sanctions_report_path()
-        if not sanctions_report_path or not os.path.exists(sanctions_report_path):
+        # Get the latest fetched sanctions data from the main application
+        sanctions_data_dict = self.get_last_sanctions_data()
+        
+        # Check if any sanctions data was actually fetched
+        has_sanctions_data = any(df is not None and not df.empty for df in sanctions_data_dict.values())
+
+        if not has_sanctions_data:
             messagebox.showwarning("Sanctions Report Missing",
-                                   "No sanctions report found. Please generate a report in the 'Sanctions Report Generator' tab first, or load one into the 'Excel Comparator' tab as 'Baseline File'.")
+                                   "No sanctions report data found in memory. Please generate a report in the 'Sanctions Report Generator' tab first.")
             return
 
         self.update_status_text("Starting sanctions check for My Vessels...")
@@ -1270,7 +1368,6 @@ class MyVesselsAppFrame(ttk.Frame):
         self.populate_vessel_tree(search_term=self.search_vessel_entry.get()) # Clear old highlights
         
         # Reset and start progress animation
-        # Initialize canvas background and bar here explicitly to avoid TclError
         self.check_progress_canvas.delete("check_progress_background")
         self.check_progress_canvas.delete("check_progress_bar")
         self.check_progress_canvas.create_rectangle(0, 0, self.check_progress_canvas.winfo_width(), 15, fill=self.FRAME_BG_COLOR, outline="", tags="check_progress_background")
@@ -1282,41 +1379,43 @@ class MyVesselsAppFrame(ttk.Frame):
         self.animate_check_pulse()
 
         threading.Thread(target=self.run_vessel_sanctions_check,
-                         args=(list(self.vessels_data), sanctions_report_path),
+                         args=(list(self.vessels_data), sanctions_data_dict), # Pass the in-memory data
                          daemon=True).start()
 
-    def run_vessel_sanctions_check(self, my_vessels, sanctions_report_path):
+    def run_vessel_sanctions_check(self, my_vessels, sanctions_data_dict):
         """Worker function to perform the actual sanctions comparison."""
         try:
+            # Diagnostic print for my_vessels content BEFORE processing
+            print(f"DEBUG: run_vessel_sanctions_check received my_vessels (len={len(my_vessels)}):")
+            for i, item in enumerate(my_vessels[:5]): # Print first 5 elements for inspection
+                print(f"DEBUG: my_vessels[{i}] type: {type(item)}, value: {item}")
+            if len(my_vessels) > 5:
+                print("DEBUG: ... (more vessels omitted)")
+
             # Import pandas inside this function to ensure it's available in the thread
             import pandas as pd_local 
 
-            # Load all sanctions data from the generated report
-            sanctions_dfs = pd_local.read_excel(sanctions_report_path, sheet_name=None)
-            
             all_sanctioned_imos_temp = set()
             sanctioned_imo_details_temp = {}
 
-            # Phase 1: Populate sanctioned_imos_temp from all loaded sanctions sheets
-            # This loop contributes to the first half (50%) of the progress bar.
-            total_sanctioned_sheets_rows = sum(len(df) for df in sanctions_dfs.values())
+            # Phase 1: Populate all_sanctioned_imos_temp from all loaded sanctions sheets
+            total_sanctioned_sheets_rows = sum(len(df) for df in sanctions_data_dict.values() if df is not None and not df.empty)
             processed_sanction_rows = 0
 
-            my_vessels_log_queue.put({'type': 'log', 'message': f"MV Check: Loading {len(sanctions_dfs)} sanctions lists from report..."})
+            my_vessels_log_queue.put({'type': 'log', 'message': f"MV Check: Loading {len(sanctions_data_dict)} sanctions lists from memory..."})
 
-            for source_name, df in sanctions_dfs.items():
-                if df.empty:
-                    my_vessels_log_queue.put({'type': 'log', 'message': f"MV Check: Skipping empty sheet: {source_name}"})
+            for source_name, df in sanctions_data_dict.items():
+                if df is None or df.empty:
+                    my_vessels_log_queue.put({'type': 'log', 'message': f"MV Check: Skipping empty or None sheet: {source_name}"})
                     continue
                 
                 imo_col_for_sheet = None
                 for col in df.columns:
                     cleaned_col_name = str(col).strip().lower()
-                    for pattern in IMO_LIKE_COLUMN_PATTERNS:
-                        if pattern in cleaned_col_name:
-                            imo_col_for_sheet = col # Found the original column name
-                            break
-                    if imo_col_for_sheet: break
+                    # Use the globally defined IMO_LIKE_COLUMN_PATTERNS
+                    if any(pattern in cleaned_col_name for pattern in IMO_LIKE_COLUMN_PATTERNS):
+                        imo_col_for_sheet = col # Found the original column name
+                        break
 
                 if imo_col_for_sheet and imo_col_for_sheet in df.columns:
                     for imo_val in df[imo_col_for_sheet].dropna().astype(str).tolist():
@@ -1343,8 +1442,17 @@ class MyVesselsAppFrame(ttk.Frame):
             checked_vessel_count = 0
             for vessel in my_vessels:
                 # The actual comparison is fast since sanctioned_imos_from_report is a set.
-                vessel_imo_cleaned = re.sub(r'\D', '', str(vessel['imo'])).strip() # Ensure consistency
-                # No need to explicitly check here, populate_vessel_tree will use the updated sets.
+                # Added check to ensure 'vessel' is a dictionary
+                if not isinstance(vessel, dict):
+                    my_vessels_log_queue.put({'type': 'log', 'message': f"ERROR: Expected dictionary for vessel, but got type {type(vessel)} with value '{vessel}'. Skipping."})
+                    continue # Skip this malformed entry
+                
+                # Check for 'imo' key specifically within the dictionary
+                if 'imo' not in vessel:
+                    my_vessels_log_queue.put({'type': 'log', 'message': f"WARNING: Vessel entry missing 'imo' key: {vessel}. Skipping."})
+                    continue
+
+                vessel_imo_cleaned = re.sub(r'\D', '', str(vessel['imo'])).strip() 
                 
                 checked_vessel_count += 1
                 # Progress for checking My Vessels starts from 50% and goes to 100%
@@ -1399,8 +1507,8 @@ class MyVesselsAppFrame(ttk.Frame):
         new_x = x_pos + 4 * direction # Speed of pulse
         # Reverse direction if hitting ends
         if new_x > canvas_width or new_x < -pulse_width:
-             direction *= -1
-             new_x = max(-pulse_width, min(new_x, canvas_width)) # Ensure it's within bounds after flip
+              direction *= -1
+              new_x = max(-pulse_width, min(new_x, canvas_width)) # Ensure it's within bounds after flip
         
         self.after(15, lambda: self.animate_check_pulse(new_x, direction)) # Recursive call for animation
 
@@ -1474,26 +1582,18 @@ class AboutAppFrame(ttk.Frame):
         ttk.Label(main_frame, text="1. Sanctions Report Generator Tab:", style='About.SubTitle.TLabel').pack(anchor="w", pady=(5, 0))
         ttk.Label(main_frame, text=(
             "   • Click 'Generate Sanctions Report'.\n"
-            "   • A 'Save As' dialog will appear. Choose a location and filename (e.g., 'Sanctions_Report.xlsx') "
-            "to save the generated Excel file.\n"
-            "   • The application will then connect to various online sources (OFAC, UK, EU DMA, UANI Google Sheet) "
+            "   • The application will then connect to various online sources (OFAC, UK, EU DMA, UANI Website) "
             "to fetch the latest vessel sanctions data.\n"
             "   • Progress and status messages will be displayed in the 'Log Output' area.\n"
-            "   • Once complete, an Excel file will be saved containing separate sheets for each sanctions source. "
-            "This generated file will automatically populate the 'Baseline Excel File' field in the 'Excel Comparator' tab."
+            "   • Once complete, the fetched data will be displayed in the 'Sanctions Report Viewer' tab."
         ), style='About.TLabel', wraplength=700, justify=tk.LEFT).pack(anchor="w", pady=(0, 5))
 
-        ttk.Label(main_frame, text="2. Excel Comparator Tab:", style='About.SubTitle.TLabel').pack(anchor="w", pady=(5, 0))
+        ttk.Label(main_frame, text="2. Sanctions Report Viewer Tab:", style='About.SubTitle.TLabel').pack(anchor="w", pady=(5, 0))
         ttk.Label(main_frame, text=(
-            "   • Select your 'Baseline Excel File' and 'Comparison Excel File' using the 'Browse' buttons. "
-            "The baseline file can be automatically loaded from the Sanctions Generator tab.\n"
-            "   • Choose which of the two files you want to be highlighted as the output.\n"
-            "   • Click 'Compare and Highlight'. A folder selection dialog will prompt you to choose where "
-            "the 'highlighted_excel_files' subfolder should be created.\n"
-            "   • Common numerical identifiers will be highlighted in red in the chosen output file, "
-            "which will be saved in the selected output folder.\n"
-            "   • Use the 'Search Numeric Values' section to find specific numbers within the currently loaded "
-            "Excel files (after a comparison has been run)."
+            "   • This tab automatically displays the data fetched by the 'Sanctions Report Generator'.\n"
+            "   • Use the 'Select Data Source' dropdown to view individual lists (OFAC, UK, EU DMA, UANI) or a combined list.\n"
+            "   • Click 'Export Current View to Excel' to save the currently displayed table to an Excel file.\n"
+            "   • Click 'Clear All Displayed Data' to remove all fetched data from memory and the display."
         ), style='About.TLabel', wraplength=700, justify=tk.LEFT).pack(anchor="w", pady=(0, 5))
 
         ttk.Label(main_frame, text="3. My Vessels Tab:", style='About.SubTitle.TLabel').pack(anchor="w", pady=(5, 0))
@@ -1503,9 +1603,9 @@ class AboutAppFrame(ttk.Frame):
             "   • Your list of vessels will be displayed in the table and automatically saved for future sessions.\n"
             "   • Select one or more vessels from the list and 'Remove Selected Vessel(s)' to delete them.\n"
             "   • 'Export My Vessels to Excel': Saves your current list of vessels to a new Excel file.\n"
-            "   • 'Compare with Sanctions Report': Generates a new Excel report that checks your vessels "
-            "against the most recently generated sanctions data. This report will indicate if your vessels "
-            "are found in any sanctions list and specify the source(s)."
+            "   • 'Check Sanctions': Compares your vessels against the most recently fetched sanctions data "
+            "from the 'Sanctions Report Generator' tab. This will indicate if your vessels are found in any "
+            "sanctions list and specify the source(s)."
         ), style='About.TLabel', wraplength=700, justify=tk.LEFT).pack(anchor="w", pady=(0, 10))
         
         ttk.Label(main_frame, text="Contact Information:", style='About.SubTitle.TLabel').pack(anchor="w", pady=(10, 0))
@@ -1531,8 +1631,8 @@ class RoyalClassificationApp(tk.Tk):
         self.minsize(900, 600)
 
         # Store path to the last generated sanctions report and a flag if My Vessels is waiting
-        self.last_sanctions_report_path = None
-        self.my_vessels_tab_needs_sanction_check = False # This flag is now less crucial without auto-trigger
+        self.last_sanctions_data = global_sanctions_data_store # Direct reference to the global store
+        self.my_vessels_tab_needs_sanction_check = False 
 
         self.configure(bg="#002060")
 
@@ -1550,49 +1650,34 @@ class RoyalClassificationApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(expand=True, fill="both", padx=10, pady=10)
 
-        # Instantiate tab frames - now correctly ordered AFTER their class definitions
-        self.sanctions_tab = SanctionsAppFrame(self.notebook)
-        self.my_vessels_tab = MyVesselsAppFrame(self.notebook, self.get_last_sanctions_report_path)
-        self.excel_comparator_tab = ExcelComparatorFrame(self.notebook)
+        # Instantiate tab frames
+        self.sanctions_display_tab = SanctionsDisplayFrame(self.notebook) # New display tab first
+        self.sanctions_tab = SanctionsAppFrame(self.notebook, self.sanctions_display_tab.display_data) # Pass display callback
+        self.my_vessels_tab = MyVesselsAppFrame(self.notebook, self.get_current_sanctions_data) # Pass getter for in-memory data
         self.about_tab = AboutAppFrame(self.notebook)
-
-        # Set callbacks between tabs
-        self.sanctions_tab.set_excel_comparator_file1_callback(self.set_excel_comparator_file1_and_sanctions_path)
-        
-        # This callback is now simpler as MyVessels no longer auto-triggers SanctionsGen.
-        # It ensures that when SanctionsAppFrame completes, this master method is notified.
-        self.sanctions_tab.automatic_generation_complete_callback = self.on_sanctions_report_complete
 
         # Add tabs to notebook in desired order
         self.notebook.add(self.sanctions_tab, text="Sanctions Report Generator")
-        self.notebook.add(self.my_vessels_tab, text="My Vessels") # My Vessels is now tab 2
-        self.notebook.add(self.excel_comparator_tab, text="Excel Comparator") # Excel Comparator is now tab 3
+        self.notebook.add(self.sanctions_display_tab, text="Sanctions Report Viewer") # New tab added
+        self.notebook.add(self.my_vessels_tab, text="My Vessels")
         self.notebook.add(self.about_tab, text="About This Application")
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def set_excel_comparator_file1_and_sanctions_path(self, filepath):
-        """
-        Callback from SanctionsAppFrame to update ExcelComparator's file1 and
-        store the path as the last generated sanctions report.
-        """
-        self.excel_comparator_tab.set_file1_path(filepath)
-        self.last_sanctions_report_path = filepath
-        print(f"Last sanctions report path updated to: {self.last_sanctions_report_path}")
+    def get_current_sanctions_data(self):
+        """Provides the current in-memory sanctions data to other components."""
+        return global_sanctions_data_store
 
-    def get_last_sanctions_report_path(self):
-        """Provides the last generated sanctions report path to MyVesselsAppFrame."""
-        return self.last_sanctions_report_path
-
-    def on_sanctions_report_complete(self, filepath):
+    def on_sanctions_report_complete(self, success_status):
         """
-        Callback triggered by SanctionsAppFrame when a report generation (manual or automatic) is complete.
-        Used to update the last_sanctions_report_path.
+        Callback triggered by SanctionsAppFrame when a report generation is complete.
+        This now just logs success and updates UI, as display is handled directly.
         """
-        self.set_excel_comparator_file1_and_sanctions_path(filepath) # Update Excel Comparator and last path
-        
-        # Removed the logic that would trigger MyVessels check automatically
-        # Now, MyVessels "Check Sanctions" button will simply use this newly generated file.
+        if success_status:
+            print("Sanctions report generation completed successfully (data in memory).")
+        else:
+            print("Sanctions report generation failed.")
+        # No more file path to pass here.
 
     def on_closing(self):
         """Handles application closing, ensuring My Vessels data is saved."""
@@ -1610,7 +1695,7 @@ if __name__ == "__main__":
     # Check common libraries
     try: import requests
     except ImportError: missing_libs_to_install.append('requests')
-    try: import pandas # Removed 'as pd' here
+    try: import pandas 
     except ImportError: missing_libs_to_install.append('pandas')
     try: import openpyxl
     except ImportError: missing_libs_to_install.append('openpyxl')
